@@ -27,6 +27,7 @@ struct Entry {
     path: PathBuf,
     size: u64,
     modified: Option<SystemTime>,
+    selected: bool,
 }
 
 enum Msg {
@@ -212,7 +213,7 @@ impl App {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Found { path, size, modified } => {
-                    self.entries.push(Entry { path, size, modified });
+                    self.entries.push(Entry { path, size, modified, selected: false });
                     self.sort();
                 }
                 Msg::ScanDone => {
@@ -278,9 +279,34 @@ impl eframe::App for App {
             ui.add_space(6.0);
         });
 
-        // --- Bottom: status
+        // --- Bottom: totals, selection actions, status
+        let total: u64 = self.entries.iter().map(|e| e.size).sum();
+        let (sel_count, sel_size) = self
+            .entries
+            .iter()
+            .filter(|e| e.selected)
+            .fold((0, 0), |(n, s), e| (n + 1, s + e.size));
+
         egui::Panel::bottom("bottom").show(ui, |ui| {
             ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.strong(format!("{} folders · {}", self.entries.len(), human_size(total)));
+                ui.separator();
+                ui.label(format!("{sel_count} selected · {}", human_size(sel_size)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_enabled(!self.scanning, egui::Button::new("Select none")).clicked() {
+                        self.entries.iter_mut().for_each(|e| e.selected = false);
+                    }
+                    if ui.add_enabled(!self.scanning, egui::Button::new("Select all shown")).clicked() {
+                        let filter = self.filter.to_lowercase();
+                        for e in &mut self.entries {
+                            if filter.is_empty() || e.path.to_string_lossy().to_lowercase().contains(&filter) {
+                                e.selected = true;
+                            }
+                        }
+                    }
+                });
+            });
             ui.horizontal(|ui| {
                 if self.scanning {
                     ui.spinner();
@@ -308,21 +334,26 @@ impl eframe::App for App {
             let filter = self.filter.to_lowercase();
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 egui::Grid::new("results").striped(true).num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
+                    ui.label("");
                     ui.strong("Size");
                     ui.strong("Modified");
                     ui.strong("Path");
                     ui.end_row();
-                    for e in &self.entries {
+                    for e in &mut self.entries {
                         if !filter.is_empty() && !e.path.to_string_lossy().to_lowercase().contains(&filter) {
                             continue;
                         }
+                        ui.add_enabled(!self.scanning, egui::Checkbox::without_text(&mut e.selected));
                         ui.add(
                             egui::ProgressBar::new(e.size as f32 / max as f32)
                                 .desired_width(110.0)
                                 .text(human_size(e.size)),
                         );
                         ui.label(age(e.modified));
-                        ui.label(e.path.display().to_string());
+                        let path = e.path.display().to_string();
+                        if ui.add(egui::Label::new(&path).sense(egui::Sense::click())).clicked() && !self.scanning {
+                            e.selected = !e.selected;
+                        }
                         ui.end_row();
                     }
                 });
