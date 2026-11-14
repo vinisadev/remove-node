@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 fn main() {
     let root = std::env::args_os()
@@ -10,7 +11,7 @@ fn main() {
     let mut found = scan(&root);
     found.sort_by(|a, b| b.size.cmp(&a.size));
     for f in &found {
-        println!("{:>10}  {}", human_size(f.size), f.path.display());
+        println!("{:>10}  {:>14}  {}", human_size(f.size), age(f.modified), f.path.display());
     }
     let total: u64 = found.iter().map(|f| f.size).sum();
     println!("Found {} node_modules folder(s) using {}.", found.len(), human_size(total));
@@ -21,6 +22,7 @@ fn main() {
 struct Found {
     path: PathBuf,
     size: u64,
+    modified: Option<SystemTime>,
 }
 
 /// Directories that are never worth descending into (virtual filesystems).
@@ -77,7 +79,8 @@ fn scan(root: &Path) -> Vec<Found> {
             if entry.file_name() == "node_modules" {
                 // Count it, but don't look for nested node_modules inside it.
                 let size = dir_size(&path);
-                found.push(Found { path, size });
+                let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
+                found.push(Found { path, size, modified });
             } else if !is_pseudo_fs(&path) {
                 stack.push(path);
             }
@@ -97,6 +100,19 @@ fn human_size(bytes: u64) -> String {
         u += 1;
     }
     if u == 0 { format!("{bytes} B") } else { format!("{v:.1} {}", UNITS[u]) }
+}
+
+fn age(t: Option<SystemTime>) -> String {
+    let Some(t) = t else { return "?".into() };
+    let Ok(d) = SystemTime::now().duration_since(t) else { return "just now".into() };
+    let days = d.as_secs() / 86_400;
+    match days {
+        0 => "today".into(),
+        1 => "1 day ago".into(),
+        2..=59 => format!("{days} days ago"),
+        60..=729 => format!("{} months ago", days / 30),
+        _ => format!("{} years ago", days / 365),
+    }
 }
 
 #[cfg(test)]
