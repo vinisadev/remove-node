@@ -45,6 +45,13 @@ struct Progress {
     current: Mutex<String>,
 }
 
+#[derive(PartialEq, Clone, Copy)]
+enum SortBy {
+    Size,
+    Path,
+    Modified,
+}
+
 struct App {
     root: String,
     entries: Vec<Entry>,
@@ -53,6 +60,8 @@ struct App {
     scanning: bool,
     cancel: Arc<AtomicBool>,
     progress: Arc<Progress>,
+    sort_by: SortBy,
+    filter: String,
     status: String,
 }
 
@@ -71,6 +80,8 @@ impl Default for App {
             scanning: false,
             cancel: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(Progress::default()),
+            sort_by: SortBy::Size,
+            filter: String::new(),
             status: "Pick a folder and press Scan.".into(),
         }
     }
@@ -202,7 +213,7 @@ impl App {
             match msg {
                 Msg::Found { path, size, modified } => {
                     self.entries.push(Entry { path, size, modified });
-                    self.entries.sort_by(|a, b| b.size.cmp(&a.size));
+                    self.sort();
                 }
                 Msg::ScanDone => {
                     self.scanning = false;
@@ -215,6 +226,14 @@ impl App {
                     );
                 }
             }
+        }
+    }
+
+    fn sort(&mut self) {
+        match self.sort_by {
+            SortBy::Size => self.entries.sort_by(|a, b| b.size.cmp(&a.size)),
+            SortBy::Path => self.entries.sort_by(|a, b| a.path.cmp(&b.path)),
+            SortBy::Modified => self.entries.sort_by(|a, b| a.modified.cmp(&b.modified)),
         }
     }
 }
@@ -240,6 +259,20 @@ impl eframe::App for App {
                     }
                 } else if ui.button("Scan").clicked() || enter {
                     self.start_scan(&ctx);
+                }
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Filter:");
+                ui.text_edit_singleline(&mut self.filter);
+                ui.separator();
+                ui.label("Sort by:");
+                let before = self.sort_by;
+                ui.selectable_value(&mut self.sort_by, SortBy::Size, "Size");
+                ui.selectable_value(&mut self.sort_by, SortBy::Path, "Path");
+                ui.selectable_value(&mut self.sort_by, SortBy::Modified, "Oldest");
+                if before != self.sort_by {
+                    self.sort();
                 }
             });
             ui.add_space(6.0);
@@ -272,6 +305,7 @@ impl eframe::App for App {
                 return;
             }
             let max = self.entries.iter().map(|e| e.size).max().unwrap_or(1).max(1);
+            let filter = self.filter.to_lowercase();
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 egui::Grid::new("results").striped(true).num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
                     ui.strong("Size");
@@ -279,6 +313,9 @@ impl eframe::App for App {
                     ui.strong("Path");
                     ui.end_row();
                     for e in &self.entries {
+                        if !filter.is_empty() && !e.path.to_string_lossy().to_lowercase().contains(&filter) {
+                            continue;
+                        }
                         ui.add(
                             egui::ProgressBar::new(e.size as f32 / max as f32)
                                 .desired_width(110.0)
