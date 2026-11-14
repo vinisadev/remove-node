@@ -1,11 +1,19 @@
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+//! remove-node — find `node_modules` folders, see how much space they use, delete them.
+
+mod format;
+mod scan;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::SystemTime;
 
 use eframe::egui;
+
+use format::{age, human_size};
+use scan::{Msg, Progress, delete, scan};
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -31,25 +39,6 @@ struct Entry {
     size: u64,
     modified: Option<SystemTime>,
     selected: bool,
-}
-
-enum Msg {
-    Found {
-        path: PathBuf,
-        size: u64,
-        modified: Option<SystemTime>,
-    },
-    ScanDone,
-    Deleted(PathBuf),
-    DeleteFailed(PathBuf, String),
-    DeleteDone,
-}
-
-/// Progress shared between the scanner thread and the UI.
-#[derive(Default)]
-struct Progress {
-    dirs_scanned: AtomicU64,
-    current: Mutex<String>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -101,143 +90,6 @@ impl Default for App {
 }
 
 // ---------------------------------------------------------------------------
-// Background work
-
-/// Directories that are never worth descending into (virtual filesystems).
-fn is_pseudo_fs(path: &Path) -> bool {
-    cfg!(unix)
-        && ["/proc", "/sys", "/dev", "/run", "/tmp/.X11-unix"]
-            .iter()
-            .any(|p| path == Path::new(p))
-}
-
-/// Bytes actually used on disk by a file (falls back to logical length).
-fn disk_size(meta: &std::fs::Metadata) -> u64 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        meta.blocks() * 512
-    }
-    #[cfg(not(unix))]
-    {
-        meta.len()
-    }
-}
-
-/// Total size of everything under `dir`, not following symlinks.
-fn dir_size(dir: &Path, cancel: &AtomicBool) -> u64 {
-    let mut total = 0;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        if cancel.load(Ordering::Relaxed) {
-            break;
-        }
-        let Ok(rd) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for entry in rd.flatten() {
-            let Ok(meta) = entry.metadata() else { continue }; // does not follow symlinks
-            total += disk_size(&meta);
-            if meta.is_dir() {
-                stack.push(entry.path());
-            }
-        }
-    }
-    total
-}
-
-fn scan(
-    root: PathBuf,
-    tx: Sender<Msg>,
-    cancel: Arc<AtomicBool>,
-    progress: Arc<Progress>,
-    ctx: egui::Context,
-) {
-    let mut stack = vec![root];
-    while let Some(dir) = stack.pop() {
-        if cancel.load(Ordering::Relaxed) {
-            break;
-        }
-        progress.dirs_scanned.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut cur) = progress.current.lock() {
-            *cur = dir.display().to_string();
-        }
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in rd.flatten() {
-            // file_type() does not follow symlinks, so symlinked dirs are skipped.
-            let Ok(ft) = entry.file_type() else { continue };
-            if !ft.is_dir() {
-                continue;
-            }
-            let path = entry.path();
-            if entry.file_name() == "node_modules" {
-                // Count it, but don't look for nested node_modules inside it.
-                let size = dir_size(&path, &cancel);
-                let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
-                let _ = tx.send(Msg::Found {
-                    path,
-                    size,
-                    modified,
-                });
-                ctx.request_repaint();
-            } else if !is_pseudo_fs(&path) {
-                stack.push(path);
-            }
-        }
-    }
-    let _ = tx.send(Msg::ScanDone);
-    ctx.request_repaint();
-}
-
-fn delete(paths: Vec<PathBuf>, tx: Sender<Msg>, ctx: egui::Context) {
-    for path in paths {
-        let msg = match std::fs::remove_dir_all(&path) {
-            Ok(()) => Msg::Deleted(path),
-            Err(e) => Msg::DeleteFailed(path, e.to_string()),
-        };
-        let _ = tx.send(msg);
-        ctx.request_repaint();
-    }
-    let _ = tx.send(Msg::DeleteDone);
-    ctx.request_repaint();
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut v = bytes as f64;
-    let mut u = 0;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
-        u += 1;
-    }
-    if u == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{v:.1} {}", UNITS[u])
-    }
-}
-
-fn age(t: Option<SystemTime>) -> String {
-    let Some(t) = t else { return "?".into() };
-    let Ok(d) = SystemTime::now().duration_since(t) else {
-        return "just now".into();
-    };
-    let days = d.as_secs() / 86_400;
-    match days {
-        0 => "today".into(),
-        1 => "1 day ago".into(),
-        2..=59 => format!("{days} days ago"),
-        60..=729 => format!("{} months ago", days / 30),
-        _ => format!("{} years ago", days / 365),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // UI
 
 impl App {
@@ -273,7 +125,7 @@ impl App {
         }
         self.deleting = true;
         self.errors.clear();
-        self.status = format!("Deleting {} folder(s)...", paths.len());
+        self.status = format!("Deleting {} folder(s)…", paths.len());
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         thread::spawn(move || delete(paths, tx, ctx));
     }
@@ -547,50 +399,5 @@ impl eframe::App for App {
             // Keep the progress line ticking.
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn finds_top_level_node_modules_only() {
-        let root = std::env::temp_dir().join(format!("remove-node-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let a = root.join("proj-a/node_modules/lodash/node_modules");
-        let b = root.join("deep/x/proj-b/node_modules");
-        std::fs::create_dir_all(&a).unwrap();
-        std::fs::create_dir_all(&b).unwrap();
-        std::fs::write(b.join("big.bin"), vec![1u8; 100_000]).unwrap();
-
-        let (tx, rx) = mpsc::channel();
-        scan(
-            root.clone(),
-            tx,
-            Arc::default(),
-            Arc::default(),
-            egui::Context::default(),
-        );
-        let mut found: Vec<(PathBuf, u64)> = rx
-            .try_iter()
-            .filter_map(|m| match m {
-                Msg::Found { path, size, .. } => Some((path, size)),
-                _ => None,
-            })
-            .collect();
-        found.sort();
-        assert_eq!(found.len(), 2, "{found:?}");
-        assert_eq!(found[0].0, b);
-        assert!(found[0].1 >= 100_000);
-        assert_eq!(found[1].0, root.join("proj-a/node_modules"));
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn formats_sizes() {
-        assert_eq!(human_size(512), "512 B");
-        assert_eq!(human_size(1536), "1.5 KB");
-        assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.0 GB");
     }
 }
