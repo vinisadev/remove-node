@@ -43,3 +43,23 @@ fn scan(root: &Path) -> Vec<PathBuf> {
     }
     found
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_top_level_node_modules_only() {
+        let root = std::env::temp_dir().join(format!("remove-node-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let a = root.join("proj-a/node_modules/lodash/node_modules");
+        let b = root.join("deep/x/proj-b/node_modules");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let mut found = scan(&root);
+        found.sort();
+        assert_eq!(found, vec![b, root.join("proj-a/node_modules")]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
