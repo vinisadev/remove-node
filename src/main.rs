@@ -21,6 +21,7 @@ fn main() -> eframe::Result {
     )
 }
 
+// ---------------------------------------------------------------------------
 // Data
 
 struct Entry {
@@ -37,9 +38,12 @@ enum Msg {
         modified: Option<SystemTime>,
     },
     ScanDone,
+    Deleted(PathBuf),
+    DeleteFailed(PathBuf, String),
+    DeleteDone,
 }
 
-/// Progress - shared between the scanner thread and the UI.
+/// Progress shared between the scanner thread and the UI.
 #[derive(Default)]
 struct Progress {
     dirs_scanned: AtomicU64,
@@ -59,10 +63,13 @@ struct App {
     rx: Receiver<Msg>,
     tx: Sender<Msg>,
     scanning: bool,
+    deleting: bool,
     cancel: Arc<AtomicBool>,
     progress: Arc<Progress>,
     sort_by: SortBy,
     filter: String,
+    confirm_delete: bool,
+    errors: Vec<String>,
     status: String,
 }
 
@@ -79,15 +86,19 @@ impl Default for App {
             rx,
             tx,
             scanning: false,
+            deleting: false,
             cancel: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(Progress::default()),
             sort_by: SortBy::Size,
             filter: String::new(),
+            confirm_delete: false,
+            errors: Vec::new(),
             status: "Pick a folder and press Scan.".into(),
         }
     }
 }
 
+// ---------------------------------------------------------------------------
 // Background work
 
 /// Directories that are never worth descending into (virtual filesystems).
@@ -98,7 +109,7 @@ fn is_pseudo_fs(path: &Path) -> bool {
             .any(|p| path == Path::new(p))
 }
 
-/// Bytes actually used on disk by a file (falls back to logical length)
+/// Bytes actually used on disk by a file (falls back to logical length).
 fn disk_size(meta: &std::fs::Metadata) -> u64 {
     #[cfg(unix)]
     {
@@ -164,6 +175,20 @@ fn scan(root: PathBuf, tx: Sender<Msg>, cancel: Arc<AtomicBool>, progress: Arc<P
     ctx.request_repaint();
 }
 
+fn delete(paths: Vec<PathBuf>, tx: Sender<Msg>, ctx: egui::Context) {
+    for path in paths {
+        let msg = match std::fs::remove_dir_all(&path) {
+            Ok(()) => Msg::Deleted(path),
+            Err(e) => Msg::DeleteFailed(path, e.to_string()),
+        };
+        let _ = tx.send(msg);
+        ctx.request_repaint();
+    }
+    let _ = tx.send(Msg::DeleteDone);
+    ctx.request_repaint();
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 
 fn human_size(bytes: u64) -> String {
@@ -190,6 +215,7 @@ fn age(t: Option<SystemTime>) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
 // UI
 
 impl App {
@@ -200,13 +226,26 @@ impl App {
             return;
         }
         self.entries.clear();
+        self.errors.clear();
         self.cancel = Arc::new(AtomicBool::new(false));
         self.progress = Arc::new(Progress::default());
         self.scanning = true;
-        self.status = "Scanning...".into();
         let (tx, cancel, progress, ctx) =
             (self.tx.clone(), self.cancel.clone(), self.progress.clone(), ctx.clone());
         thread::spawn(move || scan(root, tx, cancel, progress, ctx));
+    }
+
+    fn start_delete(&mut self, ctx: &egui::Context) {
+        let paths: Vec<PathBuf> =
+            self.entries.iter().filter(|e| e.selected).map(|e| e.path.clone()).collect();
+        if paths.is_empty() {
+            return;
+        }
+        self.deleting = true;
+        self.errors.clear();
+        self.status = format!("Deleting {} folder(s)…", paths.len());
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        thread::spawn(move || delete(paths, tx, ctx));
     }
 
     fn poll(&mut self) {
@@ -226,6 +265,18 @@ impl App {
                         human_size(self.entries.iter().map(|e| e.size).sum()),
                     );
                 }
+                Msg::Deleted(path) => self.entries.retain(|e| e.path != path),
+                Msg::DeleteFailed(path, err) => {
+                    self.errors.push(format!("{}: {err}", path.display()));
+                }
+                Msg::DeleteDone => {
+                    self.deleting = false;
+                    self.status = if self.errors.is_empty() {
+                        "Deleted.".into()
+                    } else {
+                        format!("Finished with {} error(s).", self.errors.len())
+                    };
+                }
             }
         }
     }
@@ -243,6 +294,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll();
+        let busy = self.scanning || self.deleting;
 
         // --- Top: folder + scan controls
         egui::Panel::top("top").show(ui, |ui| {
@@ -250,7 +302,7 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.label("Scan folder:");
                 let edit = ui.add_enabled(
-                    !self.scanning,
+                    !busy,
                     egui::TextEdit::singleline(&mut self.root).desired_width(ui.available_width() - 90.0),
                 );
                 let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -258,7 +310,7 @@ impl eframe::App for App {
                     if ui.button("Cancel").clicked() {
                         self.cancel.store(true, Ordering::Relaxed);
                     }
-                } else if ui.button("Scan").clicked() || enter {
+                } else if ui.add_enabled(!self.deleting, egui::Button::new("Scan")).clicked() || (enter && !busy) {
                     self.start_scan(&ctx);
                 }
             });
@@ -294,10 +346,18 @@ impl eframe::App for App {
                 ui.separator();
                 ui.label(format!("{sel_count} selected · {}", human_size(sel_size)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add_enabled(!self.scanning, egui::Button::new("Select none")).clicked() {
+                    let del = egui::Button::new(
+                        egui::RichText::new(format!("Delete selected ({})", human_size(sel_size)))
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(190, 50, 50));
+                    if ui.add_enabled(!busy && sel_count > 0, del).clicked() {
+                        self.confirm_delete = true;
+                    }
+                    if ui.add_enabled(!busy, egui::Button::new("Select none")).clicked() {
                         self.entries.iter_mut().for_each(|e| e.selected = false);
                     }
-                    if ui.add_enabled(!self.scanning, egui::Button::new("Select all shown")).clicked() {
+                    if ui.add_enabled(!busy, egui::Button::new("Select all shown")).clicked() {
                         let filter = self.filter.to_lowercase();
                         for e in &mut self.entries {
                             if filter.is_empty() || e.path.to_string_lossy().to_lowercase().contains(&filter) {
@@ -312,13 +372,19 @@ impl eframe::App for App {
                     ui.spinner();
                     let cur = self.progress.current.lock().map(|c| c.clone()).unwrap_or_default();
                     ui.label(format!(
-                        "Scanned {} dirs - {cur}",
+                        "Scanned {} dirs — {cur}",
                         self.progress.dirs_scanned.load(Ordering::Relaxed)
                     ));
                 } else {
+                    if self.deleting {
+                        ui.spinner();
+                    }
                     ui.label(&self.status);
                 }
             });
+            for err in &self.errors {
+                ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+            }
             ui.add_space(6.0);
         });
 
@@ -326,14 +392,14 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| {
             if self.entries.is_empty() {
                 ui.centered_and_justified(|ui| {
-                    ui.label(if self.scanning { "Searching..." } else { "No node_modules folders yet." });
+                    ui.label(if self.scanning { "Searching…" } else { "No node_modules folders yet." });
                 });
                 return;
             }
             let max = self.entries.iter().map(|e| e.size).max().unwrap_or(1).max(1);
             let filter = self.filter.to_lowercase();
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                egui::Grid::new("results").striped(true).num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
+                egui::Grid::new("results").striped(true).num_columns(4).spacing([12.0, 6.0]).show(ui, |ui| {
                     ui.label("");
                     ui.strong("Size");
                     ui.strong("Modified");
@@ -343,7 +409,7 @@ impl eframe::App for App {
                         if !filter.is_empty() && !e.path.to_string_lossy().to_lowercase().contains(&filter) {
                             continue;
                         }
-                        ui.add_enabled(!self.scanning, egui::Checkbox::without_text(&mut e.selected));
+                        ui.add_enabled(!busy, egui::Checkbox::without_text(&mut e.selected));
                         ui.add(
                             egui::ProgressBar::new(e.size as f32 / max as f32)
                                 .desired_width(110.0)
@@ -351,7 +417,7 @@ impl eframe::App for App {
                         );
                         ui.label(age(e.modified));
                         let path = e.path.display().to_string();
-                        if ui.add(egui::Label::new(&path).sense(egui::Sense::click())).clicked() && !self.scanning {
+                        if ui.add(egui::Label::new(&path).sense(egui::Sense::click())).clicked() && !busy {
                             e.selected = !e.selected;
                         }
                         ui.end_row();
@@ -359,6 +425,33 @@ impl eframe::App for App {
                 });
             });
         });
+
+        // --- Confirmation dialog
+        if self.confirm_delete {
+            let modal = egui::Modal::new(egui::Id::unique("confirm")).show(&ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.heading("Delete node_modules?");
+                ui.add_space(6.0);
+                ui.label(format!(
+                    "This permanently deletes {sel_count} folder(s), freeing about {}. \
+                     You can reinstall them with npm/yarn/pnpm install.",
+                    human_size(sel_size)
+                ));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        self.confirm_delete = false;
+                        self.start_delete(&ctx);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.confirm_delete = false;
+                    }
+                });
+            });
+            if modal.should_close() {
+                self.confirm_delete = false;
+            }
+        }
 
         if self.scanning {
             // Keep the progress line ticking.
