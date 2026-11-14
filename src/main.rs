@@ -1,29 +1,69 @@
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 use std::time::SystemTime;
 
-fn main() {
-    let root = std::env::args_os()
-        .nth(1)
-        .or_else(|| std::env::var_os("HOME"))
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| "/".into());
-    let mut found = scan(&root);
-    found.sort_by(|a, b| b.size.cmp(&a.size));
-    for f in &found {
-        println!("{:>10}  {:>14}  {}", human_size(f.size), age(f.modified), f.path.display());
-    }
-    let total: u64 = found.iter().map(|f| f.size).sum();
-    println!("Found {} node_modules folder(s) using {}.", found.len(), human_size(total));
+use eframe::egui;
+
+fn main() -> eframe::Result {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Remove Node")
+            .with_inner_size([960.0, 640.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "remove-node",
+        options,
+        Box::new(|_cc| Ok(Box::new(App::default()))),
+    )
 }
 
-// Scanning
+// Data
 
-struct Found {
+struct Entry {
     path: PathBuf,
     size: u64,
     modified: Option<SystemTime>,
 }
+
+enum Msg {
+    Found {
+        path: PathBuf,
+        size: u64,
+        modified: Option<SystemTime>,
+    },
+    ScanDone,
+}
+
+struct App {
+    root: String,
+    entries: Vec<Entry>,
+    rx: Receiver<Msg>,
+    tx: Sender<Msg>,
+    scanning: bool,
+    status: String,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        let (tx, rx) = mpsc::channel();
+        let root = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(|h| PathBuf::from(h).display().to_string())
+            .unwrap_or_else(|| "/".into());
+        Self {
+            root,
+            entries: Vec::new(),
+            rx,
+            tx,
+            scanning: false,
+            status: "Pick a folder and press Scan.".into(),
+        }
+    }
+}
+
+// Background work
 
 /// Directories that are never worth descending into (virtual filesystems).
 fn is_pseudo_fs(path: &Path) -> bool {
@@ -63,10 +103,8 @@ fn dir_size(dir: &Path) -> u64 {
     total
 }
 
-/// Every `node_modules` folder under `root`, with its size
-fn scan(root: &Path) -> Vec<Found> {
-    let mut found = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
+fn scan(root: PathBuf, tx: Sender<Msg>, ctx: egui::Context) {
+    let mut stack = vec![root];
     while let Some(dir) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for entry in rd.flatten() {
@@ -80,13 +118,15 @@ fn scan(root: &Path) -> Vec<Found> {
                 // Count it, but don't look for nested node_modules inside it.
                 let size = dir_size(&path);
                 let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
-                found.push(Found { path, size, modified });
+                let _ = tx.send(Msg::Found { path, size, modified });
+                ctx.request_repaint();
             } else if !is_pseudo_fs(&path) {
                 stack.push(path);
             }
         }
     }
-    found
+    let _ = tx.send(Msg::ScanDone);
+    ctx.request_repaint();
 }
 
 // Helpers
@@ -115,6 +155,86 @@ fn age(t: Option<SystemTime>) -> String {
     }
 }
 
+// UI
+
+impl App {
+    fn start_scan(&mut self, ctx: &egui::Context) {
+        let root = PathBuf::from(self.root.trim());
+        if !root.is_dir() {
+            self.status = format!("Not a directory: {}", root.display());
+            return;
+        }
+        self.entries.clear();
+        self.scanning = true;
+        self.status = "Scanning...".into();
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        thread::spawn(move || scan(root, tx, ctx));
+    }
+
+    fn poll(&mut self) {
+        while let Ok(msg) = self.rx.try_recv() {
+            match msg {
+                Msg::Found { path, size, modified } => {
+                    self.entries.push(Entry { path, size, modified });
+                }
+                Msg::ScanDone => {
+                    self.scanning = false;
+                    self.status = format!(
+                        "Done. Found {} node_modules folder(s) using {}.",
+                        self.entries.len(),
+                        human_size(self.entries.iter().map(|e| e.size).sum()),
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.poll();
+
+        // --- Top: folder + scan controls
+        egui::Panel::top("top").show(ui, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Scan folder:");
+                let edit = ui.add_enabled(
+                    !self.scanning,
+                    egui::TextEdit::singleline(&mut self.root).desired_width(ui.available_width() - 90.0),
+                );
+                let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.add_enabled(!self.scanning, egui::Button::new("Scan")).clicked() || (enter && !self.scanning) {
+                    self.start_scan(&ctx);
+                }
+            });
+            ui.add_space(6.0);
+        });
+
+        // --- Bottom: status
+        egui::Panel::bottom("bottom").show(ui, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if self.scanning {
+                    ui.spinner();
+                }
+                ui.label(&self.status);
+            });
+            ui.add_space(6.0);
+        });
+
+        // --- Center: results list
+        egui::CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                for e in &self.entries {
+                    ui.label(format!("{}  -  {}  -  {}", human_size(e.size), age(e.modified), e.path.display()));
+                }
+            });
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,7 +249,16 @@ mod tests {
         std::fs::create_dir_all(&b).unwrap();
         std::fs::write(b.join("big.bin"), vec![1u8; 100_000]).unwrap();
 
-        let mut found: Vec<(PathBuf, u64)> = scan(&root).into_iter().map(|f| (f.path, f.size)).collect();
+        let (tx, rx) = mpsc::channel();
+        scan(root.clone(), tx, egui::Context::default());
+
+        let mut found: Vec<(PathBuf, u64)> = rx
+            .try_iter()
+            .filter_map(|m| match m {
+                Msg::Found { path, size, .. } => Some((path, size)),
+                _ => None,
+            })
+            .collect();
         found.sort();
         assert_eq!(found.len(), 2, "{found:?}");
         assert_eq!(found[0].0, b);
