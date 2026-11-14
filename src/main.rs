@@ -130,7 +130,9 @@ fn dir_size(dir: &Path, cancel: &AtomicBool) -> u64 {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
         for entry in rd.flatten() {
             let Ok(meta) = entry.metadata() else { continue }; // does not follow symlinks
             total += disk_size(&meta);
@@ -142,7 +144,13 @@ fn dir_size(dir: &Path, cancel: &AtomicBool) -> u64 {
     total
 }
 
-fn scan(root: PathBuf, tx: Sender<Msg>, cancel: Arc<AtomicBool>, progress: Arc<Progress>, ctx: egui::Context) {
+fn scan(
+    root: PathBuf,
+    tx: Sender<Msg>,
+    cancel: Arc<AtomicBool>,
+    progress: Arc<Progress>,
+    ctx: egui::Context,
+) {
     let mut stack = vec![root];
     while let Some(dir) = stack.pop() {
         if cancel.load(Ordering::Relaxed) {
@@ -152,7 +160,9 @@ fn scan(root: PathBuf, tx: Sender<Msg>, cancel: Arc<AtomicBool>, progress: Arc<P
         if let Ok(mut cur) = progress.current.lock() {
             *cur = dir.display().to_string();
         }
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in rd.flatten() {
             // file_type() does not follow symlinks, so symlinked dirs are skipped.
             let Ok(ft) = entry.file_type() else { continue };
@@ -164,7 +174,11 @@ fn scan(root: PathBuf, tx: Sender<Msg>, cancel: Arc<AtomicBool>, progress: Arc<P
                 // Count it, but don't look for nested node_modules inside it.
                 let size = dir_size(&path, &cancel);
                 let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
-                let _ = tx.send(Msg::Found { path, size, modified });
+                let _ = tx.send(Msg::Found {
+                    path,
+                    size,
+                    modified,
+                });
                 ctx.request_repaint();
             } else if !is_pseudo_fs(&path) {
                 stack.push(path);
@@ -199,12 +213,18 @@ fn human_size(bytes: u64) -> String {
         v /= 1024.0;
         u += 1;
     }
-    if u == 0 { format!("{bytes} B") } else { format!("{v:.1} {}", UNITS[u]) }
+    if u == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
 }
 
 fn age(t: Option<SystemTime>) -> String {
     let Some(t) = t else { return "?".into() };
-    let Ok(d) = SystemTime::now().duration_since(t) else { return "just now".into() };
+    let Ok(d) = SystemTime::now().duration_since(t) else {
+        return "just now".into();
+    };
     let days = d.as_secs() / 86_400;
     match days {
         0 => "today".into(),
@@ -230,20 +250,28 @@ impl App {
         self.cancel = Arc::new(AtomicBool::new(false));
         self.progress = Arc::new(Progress::default());
         self.scanning = true;
-        let (tx, cancel, progress, ctx) =
-            (self.tx.clone(), self.cancel.clone(), self.progress.clone(), ctx.clone());
+        let (tx, cancel, progress, ctx) = (
+            self.tx.clone(),
+            self.cancel.clone(),
+            self.progress.clone(),
+            ctx.clone(),
+        );
         thread::spawn(move || scan(root, tx, cancel, progress, ctx));
     }
 
     fn start_delete(&mut self, ctx: &egui::Context) {
-        let paths: Vec<PathBuf> =
-            self.entries.iter().filter(|e| e.selected).map(|e| e.path.clone()).collect();
+        let paths: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|e| e.selected)
+            .map(|e| e.path.clone())
+            .collect();
         if paths.is_empty() {
             return;
         }
         self.deleting = true;
         self.errors.clear();
-        self.status = format!("Deleting {} folder(s)…", paths.len());
+        self.status = format!("Deleting {} folder(s)...", paths.len());
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         thread::spawn(move || delete(paths, tx, ctx));
     }
@@ -251,8 +279,17 @@ impl App {
     fn poll(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                Msg::Found { path, size, modified } => {
-                    self.entries.push(Entry { path, size, modified, selected: false });
+                Msg::Found {
+                    path,
+                    size,
+                    modified,
+                } => {
+                    self.entries.push(Entry {
+                        path,
+                        size,
+                        modified,
+                        selected: false,
+                    });
                     self.sort();
                 }
                 Msg::ScanDone => {
@@ -260,7 +297,11 @@ impl App {
                     let cancelled = self.cancel.load(Ordering::Relaxed);
                     self.status = format!(
                         "{} {} node_modules folder(s) using {}.",
-                        if cancelled { "Cancelled. Found" } else { "Done. Found" },
+                        if cancelled {
+                            "Cancelled. Found"
+                        } else {
+                            "Done. Found"
+                        },
                         self.entries.len(),
                         human_size(self.entries.iter().map(|e| e.size).sum()),
                     );
@@ -303,14 +344,19 @@ impl eframe::App for App {
                 ui.label("Scan folder:");
                 let edit = ui.add_enabled(
                     !busy,
-                    egui::TextEdit::singleline(&mut self.root).desired_width(ui.available_width() - 90.0),
+                    egui::TextEdit::singleline(&mut self.root)
+                        .desired_width(ui.available_width() - 90.0),
                 );
                 let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if self.scanning {
                     if ui.button("Cancel").clicked() {
                         self.cancel.store(true, Ordering::Relaxed);
                     }
-                } else if ui.add_enabled(!self.deleting, egui::Button::new("Scan")).clicked() || (enter && !busy) {
+                } else if ui
+                    .add_enabled(!self.deleting, egui::Button::new("Scan"))
+                    .clicked()
+                    || (enter && !busy)
+                {
                     self.start_scan(&ctx);
                 }
             });
@@ -342,7 +388,11 @@ impl eframe::App for App {
         egui::Panel::bottom("bottom").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.strong(format!("{} folders · {}", self.entries.len(), human_size(total)));
+                ui.strong(format!(
+                    "{} folders · {}",
+                    self.entries.len(),
+                    human_size(total)
+                ));
                 ui.separator();
                 ui.label(format!("{sel_count} selected · {}", human_size(sel_size)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -354,13 +404,21 @@ impl eframe::App for App {
                     if ui.add_enabled(!busy && sel_count > 0, del).clicked() {
                         self.confirm_delete = true;
                     }
-                    if ui.add_enabled(!busy, egui::Button::new("Select none")).clicked() {
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Select none"))
+                        .clicked()
+                    {
                         self.entries.iter_mut().for_each(|e| e.selected = false);
                     }
-                    if ui.add_enabled(!busy, egui::Button::new("Select all shown")).clicked() {
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Select all shown"))
+                        .clicked()
+                    {
                         let filter = self.filter.to_lowercase();
                         for e in &mut self.entries {
-                            if filter.is_empty() || e.path.to_string_lossy().to_lowercase().contains(&filter) {
+                            if filter.is_empty()
+                                || e.path.to_string_lossy().to_lowercase().contains(&filter)
+                            {
                                 e.selected = true;
                             }
                         }
@@ -370,7 +428,12 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 if self.scanning {
                     ui.spinner();
-                    let cur = self.progress.current.lock().map(|c| c.clone()).unwrap_or_default();
+                    let cur = self
+                        .progress
+                        .current
+                        .lock()
+                        .map(|c| c.clone())
+                        .unwrap_or_default();
                     ui.label(format!(
                         "Scanned {} dirs — {cur}",
                         self.progress.dirs_scanned.load(Ordering::Relaxed)
@@ -392,38 +455,63 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| {
             if self.entries.is_empty() {
                 ui.centered_and_justified(|ui| {
-                    ui.label(if self.scanning { "Searching…" } else { "No node_modules folders yet." });
+                    ui.label(if self.scanning {
+                        "Searching..."
+                    } else {
+                        "No node_modules folders yet."
+                    });
                 });
                 return;
             }
-            let max = self.entries.iter().map(|e| e.size).max().unwrap_or(1).max(1);
+            let max = self
+                .entries
+                .iter()
+                .map(|e| e.size)
+                .max()
+                .unwrap_or(1)
+                .max(1);
             let filter = self.filter.to_lowercase();
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                egui::Grid::new("results").striped(true).num_columns(4).spacing([12.0, 6.0]).show(ui, |ui| {
-                    ui.label("");
-                    ui.strong("Size");
-                    ui.strong("Modified");
-                    ui.strong("Path");
-                    ui.end_row();
-                    for e in &mut self.entries {
-                        if !filter.is_empty() && !e.path.to_string_lossy().to_lowercase().contains(&filter) {
-                            continue;
-                        }
-                        ui.add_enabled(!busy, egui::Checkbox::without_text(&mut e.selected));
-                        ui.add(
-                            egui::ProgressBar::new(e.size as f32 / max as f32)
-                                .desired_width(110.0)
-                                .text(human_size(e.size)),
-                        );
-                        ui.label(age(e.modified));
-                        let path = e.path.display().to_string();
-                        if ui.add(egui::Label::new(&path).sense(egui::Sense::click())).clicked() && !busy {
-                            e.selected = !e.selected;
-                        }
-                        ui.end_row();
-                    }
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui::Grid::new("results")
+                        .striped(true)
+                        .num_columns(4)
+                        .spacing([12.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("");
+                            ui.strong("Size");
+                            ui.strong("Modified");
+                            ui.strong("Path");
+                            ui.end_row();
+                            for e in &mut self.entries {
+                                if !filter.is_empty()
+                                    && !e.path.to_string_lossy().to_lowercase().contains(&filter)
+                                {
+                                    continue;
+                                }
+                                ui.add_enabled(
+                                    !busy,
+                                    egui::Checkbox::without_text(&mut e.selected),
+                                );
+                                ui.add(
+                                    egui::ProgressBar::new(e.size as f32 / max as f32)
+                                        .desired_width(110.0)
+                                        .text(human_size(e.size)),
+                                );
+                                ui.label(age(e.modified));
+                                let path = e.path.display().to_string();
+                                if ui
+                                    .add(egui::Label::new(&path).sense(egui::Sense::click()))
+                                    .clicked()
+                                    && !busy
+                                {
+                                    e.selected = !e.selected;
+                                }
+                                ui.end_row();
+                            }
+                        });
                 });
-            });
         });
 
         // --- Confirmation dialog
@@ -475,7 +563,13 @@ mod tests {
         std::fs::write(b.join("big.bin"), vec![1u8; 100_000]).unwrap();
 
         let (tx, rx) = mpsc::channel();
-        scan(root.clone(), tx, Arc::default(), Arc::default(), egui::Context::default());
+        scan(
+            root.clone(),
+            tx,
+            Arc::default(),
+            Arc::default(),
+            egui::Context::default(),
+        );
         let mut found: Vec<(PathBuf, u64)> = rx
             .try_iter()
             .filter_map(|m| match m {
