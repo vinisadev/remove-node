@@ -176,6 +176,7 @@ impl App {
             match msg {
                 Msg::Found { path, size, modified } => {
                     self.entries.push(Entry { path, size, modified });
+                    self.entries.sort_by(|a, b| b.size.cmp(&a.size));
                 }
                 Msg::ScanDone => {
                     self.scanning = false;
@@ -226,10 +227,30 @@ impl eframe::App for App {
 
         // --- Center: results list
         egui::CentralPanel::default().show(ui, |ui| {
+            if self.entries.is_empty() {
+                ui.centered_and_justified(|ui| {
+                    ui.label(if self.scanning { "Searching..." } else { "No node_modules folders yet." });
+                });
+                return;
+            }
+            let max = self.entries.iter().map(|e| e.size).max().unwrap_or(1).max(1);
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                for e in &self.entries {
-                    ui.label(format!("{}  -  {}  -  {}", human_size(e.size), age(e.modified), e.path.display()));
-                }
+                egui::Grid::new("results").striped(true).num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
+                    ui.strong("Size");
+                    ui.strong("Modified");
+                    ui.strong("Path");
+                    ui.end_row();
+                    for e in &self.entries {
+                        ui.add(
+                            egui::ProgressBar::new(e.size as f32 / max as f32)
+                                .desired_width(110.0)
+                                .text(human_size(e.size)),
+                        );
+                        ui.label(age(e.modified));
+                        ui.label(e.path.display().to_string());
+                        ui.end_row();
+                    }
+                });
             });
         });
     }
