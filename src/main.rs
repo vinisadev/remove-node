@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::SystemTime;
 
@@ -36,12 +38,21 @@ enum Msg {
     ScanDone,
 }
 
+/// Progress - shared between the scanner thread and the UI.
+#[derive(Default)]
+struct Progress {
+    dirs_scanned: AtomicU64,
+    current: Mutex<String>,
+}
+
 struct App {
     root: String,
     entries: Vec<Entry>,
     rx: Receiver<Msg>,
     tx: Sender<Msg>,
     scanning: bool,
+    cancel: Arc<AtomicBool>,
+    progress: Arc<Progress>,
     status: String,
 }
 
@@ -58,6 +69,8 @@ impl Default for App {
             rx,
             tx,
             scanning: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(Progress::default()),
             status: "Pick a folder and press Scan.".into(),
         }
     }
@@ -87,10 +100,13 @@ fn disk_size(meta: &std::fs::Metadata) -> u64 {
 }
 
 /// Total size of everything under `dir`, not following symlinks.
-fn dir_size(dir: &Path) -> u64 {
+fn dir_size(dir: &Path, cancel: &AtomicBool) -> u64 {
     let mut total = 0;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         let Ok(rd) = std::fs::read_dir(&d) else { continue };
         for entry in rd.flatten() {
             let Ok(meta) = entry.metadata() else { continue }; // does not follow symlinks
@@ -103,9 +119,16 @@ fn dir_size(dir: &Path) -> u64 {
     total
 }
 
-fn scan(root: PathBuf, tx: Sender<Msg>, ctx: egui::Context) {
+fn scan(root: PathBuf, tx: Sender<Msg>, cancel: Arc<AtomicBool>, progress: Arc<Progress>, ctx: egui::Context) {
     let mut stack = vec![root];
     while let Some(dir) = stack.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        progress.dirs_scanned.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut cur) = progress.current.lock() {
+            *cur = dir.display().to_string();
+        }
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for entry in rd.flatten() {
             // file_type() does not follow symlinks, so symlinked dirs are skipped.
@@ -116,7 +139,7 @@ fn scan(root: PathBuf, tx: Sender<Msg>, ctx: egui::Context) {
             let path = entry.path();
             if entry.file_name() == "node_modules" {
                 // Count it, but don't look for nested node_modules inside it.
-                let size = dir_size(&path);
+                let size = dir_size(&path, &cancel);
                 let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
                 let _ = tx.send(Msg::Found { path, size, modified });
                 ctx.request_repaint();
@@ -165,10 +188,13 @@ impl App {
             return;
         }
         self.entries.clear();
+        self.cancel = Arc::new(AtomicBool::new(false));
+        self.progress = Arc::new(Progress::default());
         self.scanning = true;
         self.status = "Scanning...".into();
-        let (tx, ctx) = (self.tx.clone(), ctx.clone());
-        thread::spawn(move || scan(root, tx, ctx));
+        let (tx, cancel, progress, ctx) =
+            (self.tx.clone(), self.cancel.clone(), self.progress.clone(), ctx.clone());
+        thread::spawn(move || scan(root, tx, cancel, progress, ctx));
     }
 
     fn poll(&mut self) {
@@ -180,8 +206,10 @@ impl App {
                 }
                 Msg::ScanDone => {
                     self.scanning = false;
+                    let cancelled = self.cancel.load(Ordering::Relaxed);
                     self.status = format!(
-                        "Done. Found {} node_modules folder(s) using {}.",
+                        "{} {} node_modules folder(s) using {}.",
+                        if cancelled { "Cancelled. Found" } else { "Done. Found" },
                         self.entries.len(),
                         human_size(self.entries.iter().map(|e| e.size).sum()),
                     );
@@ -206,7 +234,11 @@ impl eframe::App for App {
                     egui::TextEdit::singleline(&mut self.root).desired_width(ui.available_width() - 90.0),
                 );
                 let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.add_enabled(!self.scanning, egui::Button::new("Scan")).clicked() || (enter && !self.scanning) {
+                if self.scanning {
+                    if ui.button("Cancel").clicked() {
+                        self.cancel.store(true, Ordering::Relaxed);
+                    }
+                } else if ui.button("Scan").clicked() || enter {
                     self.start_scan(&ctx);
                 }
             });
@@ -219,8 +251,14 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 if self.scanning {
                     ui.spinner();
+                    let cur = self.progress.current.lock().map(|c| c.clone()).unwrap_or_default();
+                    ui.label(format!(
+                        "Scanned {} dirs - {cur}",
+                        self.progress.dirs_scanned.load(Ordering::Relaxed)
+                    ));
+                } else {
+                    ui.label(&self.status);
                 }
-                ui.label(&self.status);
             });
             ui.add_space(6.0);
         });
@@ -253,6 +291,11 @@ impl eframe::App for App {
                 });
             });
         });
+
+        if self.scanning {
+            // Keep the progress line ticking.
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
     }
 }
 
@@ -271,8 +314,7 @@ mod tests {
         std::fs::write(b.join("big.bin"), vec![1u8; 100_000]).unwrap();
 
         let (tx, rx) = mpsc::channel();
-        scan(root.clone(), tx, egui::Context::default());
-
+        scan(root.clone(), tx, Arc::default(), Arc::default(), egui::Context::default());
         let mut found: Vec<(PathBuf, u64)> = rx
             .try_iter()
             .filter_map(|m| match m {
