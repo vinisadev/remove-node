@@ -12,6 +12,14 @@ fn main() {
     }
 }
 
+/// Directories that are never worth descending into (virtual filesystems).
+fn is_pseudo_fs(path: &Path) -> bool {
+    cfg!(unix)
+        && ["/proc", "/sys", "/dev", "/run", "/tmp/.X11-unix"]
+            .iter()
+            .any(|p| path == Path::new(p))
+}
+
 /// Every `node_modules` folder under `root`.
 fn scan(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
@@ -28,7 +36,7 @@ fn scan(root: &Path) -> Vec<PathBuf> {
             if entry.file_name() == "node_modules" {
                 // Count it, but don't look for nested node_modules inside it.
                 found.push(path);
-            } else {
+            } else if !is_pseudo_fs(&path) {
                 stack.push(path);
             }
         }
